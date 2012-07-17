@@ -246,12 +246,13 @@ struct modminer_fpga_state {
 	struct work running_work;
 	struct timeval tv_workstart;
 	uint32_t hashes;
-
+	
 	char next_work_cmd[46];
 
 	unsigned char clock;
 	int no_nonce_counter;
 	int good_share_counter;
+	int shares_since_error;
 	time_t last_cutoff_reduced;
 
 	unsigned char temp;
@@ -301,6 +302,36 @@ modminer_reduce_clock(struct thr_info*thr, bool needlock)
 		mutex_unlock(&modminer->device_mutex);
 
 	applog(LOG_WARNING, "%s %u.%u: Setting clock speed to %u", modminer->api->name, modminer->device_id, fpgaid, state->clock);
+
+	return true;
+}
+static bool
+modminer_increase_clock(struct thr_info*thr, bool needlock)
+{
+	struct cgpu_info*modminer = thr->cgpu;
+	struct modminer_fpga_state *state = thr->cgpu_data;
+	char fpgaid = thr->device_thread;
+	int fd = modminer->device_fd;
+	unsigned char cmd[6], buf[1];
+
+	if (state->clock <= 100 || state->clock >= 208)
+		return false;
+
+	cmd[0] = '\x06';  // set clock speed
+	cmd[1] = fpgaid;
+	cmd[2] = state->clock += 2;
+	cmd[3] = cmd[4] = cmd[5] = '\0';
+
+	if (needlock)
+		mutex_lock(&modminer->device_mutex);
+	if (6 != write(fd, cmd, 6))
+		bailout2(LOG_ERR, "%s %u.%u: Error writing (set clock speed)", modminer->api->name, modminer->device_id, fpgaid);
+	if (serial_read(fd, &buf, 1) != 1)
+		bailout2(LOG_ERR, "%s %u.%u: Error reading (set clock speed)", modminer->api->name, modminer->device_id, fpgaid);
+	if (needlock)
+		mutex_unlock(&modminer->device_mutex);
+
+	applog(LOG_WARNING, "%s %u.%u: Increasing clock speed to %u", modminer->api->name, modminer->device_id, fpgaid, state->clock);
 
 	return true;
 }
@@ -496,17 +527,30 @@ modminer_process_results(struct thr_info*thr)
 			if (!bad)
 			{
 				++state->good_share_counter;
+				++state->shares_since_error;
 				submit_nonce(thr, work, nonce);
+				//if we've been mining for a while, consider upclocking
+				if(state->shares_since_error > 100)
+				{
+					modminer_increase_clock(thr,true);
+					state->shares_since_error = 0;						
+				}
 			}
 			else
 			if (unlikely((!state->good_share_counter) && nonce == 0xffffff00))
 				// Firmware returns 0xffffff00 immediately if we set clockspeed too high; but it's not a hw error and shouldn't affect future downclocking
 				modminer_reduce_clock(thr, true);
 			else {
-				++hw_errors;
-				if (++modminer->hw_errors * 100 > 1000 + state->good_share_counter)
-					// Only reduce clocks if hardware errors are more than ~1% of results
-					modminer_reduce_clock(thr, true);
+				++hw_errors;	
+				//downclock if MMQ line item errors exceed 2% of accepted shares
+				if (++modminer->hw_errors > (state->good_share_counter * 0.02))
+				{
+				//applog(LOG_WARNING, "%s %u.%u: Nonce failed test: %u", modminer->api->name, modminer->device_id, fpgaid, nonce);
+				modminer_reduce_clock(thr, true);
+				hw_errors = 0; //reset count of errors this round - this is top line HW: stat
+				//modminer->hw_errors = 0; //don't reset session total - this is MMQ  line item HW: stat
+				state->shares_since_error = 0; //reset upclock counter
+				}
 			}
 		}
 		else
